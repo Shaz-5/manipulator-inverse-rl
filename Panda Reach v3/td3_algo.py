@@ -205,7 +205,8 @@ class TD3Trainer:
         self.update_target_parameters()
         
         
-    def td3_train(self, n_episodes=1500, opt_steps=64, print_every=100, render_save_path=None, plot_save_path=None):
+    def td3_train(self, n_episodes=1500, opt_steps=64, reward_weights=None, 
+                  print_every=100, render_save_path=None, plot_save_path=None):
         
         if render_save_path:
             env = gym.wrappers.RecordVideo(self.env, video_folder=render_save_path, 
@@ -238,9 +239,16 @@ class TD3Trainer:
 
                 # Execute the chosen action in the environment
                 next_observation, reward, done, truncated, _ = env.step(np.array(action))
-                next_obs, next_achgoal, next_desgoal = next_observation.values()
-                next_state = np.concatenate((next_obs, next_achgoal, next_desgoal))
+                next_obs, next_achieved_goal, next_desired_goal = next_observation.values()
+                next_state = np.concatenate((next_obs, next_achieved_goal, next_desired_goal))
                 # print(next_observation)
+                
+                if reward_weights is not None:
+                    features = torch.tensor(state, dtype=torch.float32).to(self.device)
+                    reward_weights = reward_weights.to(self.device)
+                    reward = (reward_weights.t()) @ features                 # w^T ⋅ φ
+                    
+                    #print(reward_weights.t().shape, features.shape, reward.shape)
 
                 # Store experience in the replay buffer
                 self.memory.push(state, action, reward, next_state, done)
@@ -250,7 +258,10 @@ class TD3Trainer:
                 next_obs_array.append(next_observation)
 
                 observation = next_observation
-                score += reward
+                if reward_weights is not None:
+                    score += reward.cpu().numpy()[0]
+                else:
+                    score += reward
                 step += 1
 
             # augment replay buffer with HER
@@ -282,64 +293,87 @@ class TD3Trainer:
     def her_augmentation(self, observations, actions, next_observations, k = 4):
         """
         Augment the agent's replay buffer using Hindsight Experience Replay (HER).
+
+        This function iterates through the provided observations, actions, and next observations,
+        performing HER augmentation to create multiple training examples from each experience.
         """
         # augment the replay buffer
         num_samples = len(actions)
         for index in range(num_samples):
             for _ in range(k):
+                # sample a future state (observation and goal) from later in the episode
                 future_index = np.random.randint(index, num_samples)
                 future_observation, future_achieved_goal, _ = next_observations[future_index].values()
                 # print(future_achieved_goal)
 
+                # extract current observation and action from the experience
                 observation, _, _ = observations[future_index].values()
                 
+                # create state representation including the future achieved goal (as if it were the intended goal)
                 state = torch.tensor(np.concatenate((observation, future_achieved_goal, future_achieved_goal)), 
                                      dtype=torch.float32).to(self.device)
 
                 next_observation, _, _ = next_observations[future_index].values()
                 
+                # create next state representation with the same goal for consistency
                 next_state = torch.tensor(np.concatenate((next_observation, future_achieved_goal, 
                                                           future_achieved_goal)), dtype=torch.float32).to(self.device)
 
+                # extract action from the experience
                 action = torch.tensor(actions[future_index], dtype=torch.float32).to(self.device)
+                
+                # calculate reward based on achieving the future goal from the current state and action
                 reward = self.env.unwrapped.compute_reward(future_achieved_goal, future_achieved_goal, 1.0)
 
-                # Store augmented experience in buffer
+                # store augmented experience in buffer
                 state = state.cpu().numpy()
                 action = action.cpu().numpy()
                 next_state = next_state.cpu().numpy()
 
-                # Store augmented experience in buffer
                 self.memory.push(state, action, reward, next_state, True)
                 
                 
-    def test_model(self, env=None, render_save_path=None, fps=30):
+    def test_model(self, steps, env=None, save_states=False, render_save_path=None, fps=30):
         """
         Run the trained agent in the environment.
         """
         if env is None:
             env = self.env
         episode_score = 0
+        state_list = []     # List to store state feature vectors
+        
         observation, info = env.reset()
-        images = [env.render()]
+        current_observation, current_achieved_goal, current_desired_goal = observation.values()
+        state = np.concatenate((current_observation, current_achieved_goal, current_desired_goal))
+                        
+        if save_states:
+            state_list.append(torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device))
+        
+        images = []
         done = False
         truncated = False
         
         with torch.inference_mode():
-            while not done:
+            for i in range(steps):
                 if render_save_path:
                     images.append(env.render())
-                curr_obs, curr_achgoal, curr_desgoal = observation.values()
-                state = np.concatenate((curr_obs, curr_achgoal, curr_desgoal))
 
                 action = self.select_action(state)
 
-                next_observation, reward, done, truncated, _ = env.step(np.array(action))
-                observation = next_observation
+                observation, reward, done, truncated, _ = env.step(np.array(action))
+                
+                current_observation, current_achieved_goal, current_desired_goal = observation.values()
+                state = np.concatenate((current_observation, current_achieved_goal, current_desired_goal))
+
+                if save_states:
+                    state_list.append(torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device))
+                
                 episode_score += reward
 
                 if done or truncated:
-                    images.append(env.render())
+                    if render_save_path:
+                        images.append(env.render())
+                    break
 
         if render_save_path:
             # env.close()
@@ -347,7 +381,10 @@ class TD3Trainer:
             with open(f'{render_save_path}.gif', 'rb') as f:
                 display.display(display.Image(data=f.read(), format='gif'))
                 
-        return episode_score
+        if not save_states:
+            return episode_score
+        else:
+            return episode_score, state_list
     
     
     def plot_scores(self, scores, avg_scores, plot_save_path):
