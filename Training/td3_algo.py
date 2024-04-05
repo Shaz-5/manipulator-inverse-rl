@@ -19,8 +19,8 @@ from replay import ExperienceReplayMemory
 # Agent
 class TD3Trainer:
     def __init__(self, env, input_dims, alpha=0.001, beta=0.002, gamma=0.99, tau=0.05, 
-                 batch_size=256, replay_size=10**6, update_actor_every=2, warmup=500, 
-                 noise_factor=0.1, agent_name='agent', model_save_path=None):
+                 batch_size=256, replay_size=10**6, update_actor_every=2, exploration_period=500, 
+                 noise_factor=0.1, agent_name='agent', model_save_path=None, model_load_path=None):
         
         # hyperparameters
         self.alpha = alpha  # actor learning rate
@@ -30,13 +30,14 @@ class TD3Trainer:
         self.batch_size = batch_size  # training batch size
         self.time_step = 0
         self.input_dims = input_dims
-        self.warmup = warmup  # exploration period
+        self.exploration_period = exploration_period  # exploration period
         self.training_step_count = 0
         self.update_actor_every = update_actor_every
-        self.noise_factor = noise_factor   #exploration noise factor
+        self.noise_factor = noise_factor   # exploration noise factor
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.best_score = 0
         self.agent_name = agent_name
+        self.is_trained = False
         if model_save_path is None:
             self.model_save_path = f'../Data/{agent_name}'
         else:
@@ -52,28 +53,35 @@ class TD3Trainer:
         self.memory = ExperienceReplayMemory(replay_size, input_dims, self.n_actions)
 
         # initialize actor and critic networks
-        self.initialize_networks(self.n_actions)
-        self.update_target_parameters(tau=1)
+        if model_load_path:
+            self.initialize_networks(self.n_actions, checkpoints_dir=model_load_path)
+            self.load_model()
+        else:
+            self.initialize_networks(self.n_actions)
+            self.update_target_parameters(tau=1)
 
 
-    def initialize_networks(self, n_actions):
+    def initialize_networks(self, n_actions, checkpoints_dir=None):
         """
-        Initialize actor and critic networks for TD3 agent
+        Initialize actor and critic networks for TD3 agent.
         """
+        if checkpoints_dir is None:
+            checkpoints_dir=self.model_save_path
+            
         model = "TD3"
         self.actor = Actor(state_shape=self.input_dims, num_actions=n_actions, 
-                           name="actor", checkpoints_dir=self.model_save_path).to(self.device)
+                           name="actor", checkpoints_dir=checkpoints_dir).to(self.device)
         self.critic_1 = Critic(state_action_shape=self.input_dims+self.n_actions,
-                               name="critic_1", checkpoints_dir=self.model_save_path).to(self.device)
+                               name="critic_1", checkpoints_dir=checkpoints_dir).to(self.device)
         self.critic_2 = Critic(state_action_shape=self.input_dims+self.n_actions,
-                               name="critic_2", checkpoints_dir=self.model_save_path).to(self.device)
+                               name="critic_2", checkpoints_dir=checkpoints_dir).to(self.device)
 
         self.target_actor = Actor(state_shape=self.input_dims, num_actions=n_actions, 
-                                  name="target_actor", checkpoints_dir=self.model_save_path).to(self.device)
+                                  name="target_actor", checkpoints_dir=checkpoints_dir).to(self.device)
         self.target_critic_1 = Critic(state_action_shape=self.input_dims+self.n_actions, 
-                                      name="target_critic_1", checkpoints_dir=self.model_save_path).to(self.device)
+                                      name="target_critic_1", checkpoints_dir=checkpoints_dir).to(self.device)
         self.target_critic_2 = Critic(state_action_shape=self.input_dims+self.n_actions, 
-                                      name="target_critic_2", checkpoints_dir=self.model_save_path).to(self.device)
+                                      name="target_critic_2", checkpoints_dir=checkpoints_dir).to(self.device)
 
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.alpha)
         self.critic_1_optimizer = optim.Adam(self.critic_1.parameters(), lr=self.beta)
@@ -120,8 +128,8 @@ class TD3Trainer:
         Select an action for the agent.
          
         """
-        # Selects random action to promote exploration for the warmup period
-        if self.time_step < self.warmup:
+        # Selects random action to promote exploration for the exploration_period period
+        if self.time_step < self.exploration_period and self.is_trained==False:
             mu = np.random.normal(scale=self.noise_factor, size=(self.n_actions,))
         else:
             state = torch.tensor([observation], dtype=torch.float32).to(self.device)
@@ -266,19 +274,15 @@ class TD3Trainer:
                 self.save_model()
                 
         # Plot training performance
-        if plot_save_path:
-            self.plot_scores(scores=score_history, avg_scores=avg_score_history, plot_save_path=plot_save_path)
+        self.plot_scores(scores=score_history, avg_scores=avg_score_history, plot_save_path=plot_save_path)
 
         return score_history, avg_score_history
     
             
-    def her_augmentation(self, observations, actions, next_observations):
+    def her_augmentation(self, observations, actions, next_observations, k = 4):
         """
         Augment the agent's replay buffer using Hindsight Experience Replay (HER).
         """
-        # hyperparameter for future goals sampling
-        k = 4
-
         # augment the replay buffer
         num_samples = len(actions)
         for index in range(num_samples):
@@ -378,6 +382,7 @@ class TD3Trainer:
         """
         Load trained models.
         """
+        self.is_trained = True
         self.actor.load_state_dict(torch.load(self.actor.checkpoints_file))
         self.critic_1.load_state_dict(torch.load(self.critic_1.checkpoints_file))
         self.critic_2.load_state_dict(torch.load(self.critic_2.checkpoints_file))
