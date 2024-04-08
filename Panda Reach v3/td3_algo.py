@@ -244,7 +244,7 @@ class TD3Trainer:
                 # print(next_observation)
                 
                 if reward_weights is not None:
-                    features = torch.tensor(state, dtype=torch.float32).to(self.device)
+                    features = self.construct_feature_vector(observation).to(self.device)
                     reward_weights = reward_weights.to(self.device)
                     reward = (reward_weights.t()) @ features                 # w^T ⋅ φ
                     
@@ -278,7 +278,7 @@ class TD3Trainer:
             if avg_score > self.best_score:
                 self.best_score = avg_score
 
-            if i % print_every==0:
+            if i % print_every==0 and i!=0:
                 print(f"Episode: {i} \t Steps: {step} \t Score: {score:.1f} \t Average score: {avg_score:.1f}")
             
             if self.model_save_path and i % (n_episodes//10)==0:
@@ -331,6 +331,28 @@ class TD3Trainer:
                 next_state = next_state.cpu().numpy()
 
                 self.memory.push(state, action, reward, next_state, True)
+                
+                
+    def construct_feature_vector(self, observation):
+        """
+        Normalize observation components and construct a feature vector for the given observation.
+        """
+        # Normalize observation components
+        obs = observation['observation']
+        achieved_goal = observation['achieved_goal']
+        desired_goal = observation['desired_goal']
+
+        normalized_obs = (obs - self.env.observation_space['observation'].low) / \
+                         (self.env.observation_space['observation'].high - self.env.observation_space['observation'].low)
+        normalized_achieved_goal = (achieved_goal - self.env.observation_space['achieved_goal'].low) / \
+                                    (self.env.observation_space['achieved_goal'].high - self.env.observation_space['achieved_goal'].low)
+        normalized_desired_goal = (desired_goal - self.env.observation_space['desired_goal'].low) / \
+                                   (self.env.observation_space['desired_goal'].high - self.env.observation_space['desired_goal'].low)
+
+        # Construct feature vector
+        feature_vector = np.concatenate((normalized_obs, normalized_achieved_goal, normalized_desired_goal))
+
+        return torch.tensor(feature_vector, dtype=torch.float32)
                 
                 
     def test_model(self, steps, env=None, save_states=False, render_save_path=None, fps=30):
