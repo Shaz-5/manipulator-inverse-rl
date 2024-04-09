@@ -29,7 +29,7 @@ class TD3Trainer:
         self.tau = tau      # soft update factor
         self.batch_size = batch_size  # training batch size
         self.time_step = 0
-        self.input_dims = input_dims
+        self.input_dims = input_dims   # input dimensions
         self.exploration_period = exploration_period  # exploration period
         self.training_step_count = 0
         self.update_actor_every = update_actor_every
@@ -68,7 +68,6 @@ class TD3Trainer:
         if checkpoints_dir is None:
             checkpoints_dir=self.model_save_path
             
-        model = "TD3"
         self.actor = Actor(state_shape=self.input_dims, num_actions=n_actions, 
                            name="actor", checkpoints_dir=checkpoints_dir).to(self.device)
         self.critic_1 = Critic(state_action_shape=self.input_dims+self.n_actions,
@@ -106,6 +105,7 @@ class TD3Trainer:
 
         target_network.load_state_dict(target_params)
         
+        
     def update_target_parameters(self, tau=None):
         """
         Update the weights of the target actor and both target critic networks using soft update rule.
@@ -135,8 +135,8 @@ class TD3Trainer:
             state = torch.tensor([observation], dtype=torch.float32).to(self.device)
             mu = self.actor(state).detach().cpu().numpy()[0]
             
-        mu_star = mu + np.random.normal(scale=self.noise_factor, size=self.n_actions)
-        mu_star = np.clip(mu_star, self.min_action, self.max_action)
+        mu_star = mu + np.random.normal(scale=self.noise_factor, size=self.n_actions)   # add noise
+        mu_star = np.clip(mu_star, self.min_action, self.max_action)   # clip action
         self.time_step += 1
 
         return mu_star
@@ -151,7 +151,6 @@ class TD3Trainer:
         Perform gradient descent on the actor network with a delayed update schedule; 
         the actor is updated once for every two updates of the critic networks.
         """
-
         # check if there are enough experiences in memory
         if self.memory.size < self.batch_size:
             return
@@ -234,10 +233,10 @@ class TD3Trainer:
                 state = np.concatenate((current_observation, achieved_goal, desired_goal))
                 # print(state)
 
-                # Choose an action
+                # select action
                 action = self.select_action(state)
 
-                # Execute the chosen action in the environment
+                # take action
                 next_observation, reward, done, truncated, _ = env.step(np.array(action))
                 next_obs, next_achieved_goal, next_desired_goal = next_observation.values()
                 next_state = np.concatenate((next_obs, next_achieved_goal, next_desired_goal))
@@ -250,7 +249,7 @@ class TD3Trainer:
                     
                     #print(reward_weights.t().shape, features.shape, reward.shape)
 
-                # Store experience in the replay buffer
+                # store experience in replay buffer
                 self.memory.push(state, action, reward, next_state, done)
 
                 obs_array.append(observation)
@@ -281,6 +280,7 @@ class TD3Trainer:
             if i % print_every==0 and i!=0:
                 print(f"Episode: {i} \t Steps: {step} \t Score: {score:.1f} \t Average score: {avg_score:.1f}")
             
+            # save model
             if self.model_save_path and i % (n_episodes//10)==0:
                 self.save_model()
                 
@@ -315,7 +315,7 @@ class TD3Trainer:
 
                 next_observation, _, _ = next_observations[future_index].values()
                 
-                # create next state representation with the same goal for consistency
+                # create next state representation with the same goal
                 next_state = torch.tensor(np.concatenate((next_observation, future_achieved_goal, 
                                                           future_achieved_goal)), dtype=torch.float32).to(self.device)
 
@@ -337,7 +337,7 @@ class TD3Trainer:
         """
         Normalize observation components and construct a feature vector for the given observation.
         """
-        # Normalize observation components
+        # normalize observation components
         obs = observation['observation']
         achieved_goal = observation['achieved_goal']
         desired_goal = observation['desired_goal']
@@ -349,7 +349,7 @@ class TD3Trainer:
         normalized_desired_goal = (desired_goal - self.env.observation_space['desired_goal'].low) / \
                                    (self.env.observation_space['desired_goal'].high - self.env.observation_space['desired_goal'].low)
 
-        # Construct feature vector
+        # construct feature vector
         feature_vector = np.concatenate((normalized_obs, normalized_achieved_goal, normalized_desired_goal))
 
         return torch.tensor(feature_vector, dtype=torch.float32)
@@ -362,7 +362,7 @@ class TD3Trainer:
         if env is None:
             env = self.env
         episode_score = 0
-        state_list = []     # List to store state feature vectors
+        state_list = []     # list to store state feature vectors
         
         observation, info = env.reset()
         current_observation, current_achieved_goal, current_desired_goal = observation.values()
@@ -375,6 +375,7 @@ class TD3Trainer:
         done = False
         truncated = False
         
+        # run the environment for some steps and collect rewards (and optionally states)
         with torch.inference_mode():
             for i in range(steps):
                 if render_save_path:
@@ -407,23 +408,6 @@ class TD3Trainer:
             return episode_score
         else:
             return episode_score, state_list
-    
-    
-    def plot_scores(self, scores, avg_scores, plot_save_path):
-        """
-        Plot performance of agent.
-        """
-        plt.figure(figsize=(10,8))
-        plt.plot(scores)
-        plt.plot(avg_scores)
-        plt.title(f'Performance of {self.agent_name}')
-        plt.xlabel('Episode')
-        plt.ylabel('Score')
-        if plot_save_path:
-            plt.savefig(plot_save_path, bbox_inches='tight')
-            plt.show()
-        else:
-            plt.show()
                 
                 
     def save_model(self):
@@ -448,3 +432,20 @@ class TD3Trainer:
         self.target_actor.load_state_dict(torch.load(self.target_actor.checkpoints_file))
         self.target_critic_1.load_state_dict(torch.load(self.target_critic_1.checkpoints_file))
         self.target_critic_2.load_state_dict(torch.load(self.target_critic_2.checkpoints_file))
+        
+        
+    def plot_scores(self, scores, avg_scores, plot_save_path):
+        """
+        Plot performance of agent.
+        """
+        plt.figure(figsize=(10,8))
+        plt.plot(scores)
+        plt.plot(avg_scores)
+        plt.title(f'Performance of {self.agent_name}')
+        plt.xlabel('Episode')
+        plt.ylabel('Score')
+        if plot_save_path:
+            plt.savefig(plot_save_path, bbox_inches='tight')
+            plt.show()
+        else:
+            plt.show()
