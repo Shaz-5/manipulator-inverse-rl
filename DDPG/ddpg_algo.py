@@ -19,7 +19,7 @@ from replay import ExperienceReplayMemory
 
     
 # Agent
-class TD3Trainer:
+class DDPGTrainer:
     def __init__(self, env, input_dims, alpha=0.001, beta=0.002, gamma=0.99, tau=0.05, 
                  batch_size=256, replay_size=10**6, update_actor_every=2, exploration_period=500, 
                  noise_factor=0.1, agent_name='agent', model_save_path=None, model_load_path=None):
@@ -30,8 +30,7 @@ class TD3Trainer:
         self.gamma = gamma  # discount factor
         self.tau = tau      # soft update factor
         self.batch_size = batch_size  # training batch size
-        self.time_step = 0
-        self.input_dims = input_dims   # input dimensions
+        self.input_dims = input_dims
         self.exploration_period = exploration_period  # exploration period
         self.training_step_count = 0
         self.update_actor_every = update_actor_every
@@ -72,25 +71,19 @@ class TD3Trainer:
             
         self.actor = Actor(state_shape=self.input_dims, num_actions=n_actions, 
                            name="actor", checkpoints_dir=checkpoints_dir).to(self.device)
-        self.critic_1 = Critic(state_action_shape=self.input_dims+self.n_actions,
-                               name="critic_1", checkpoints_dir=checkpoints_dir).to(self.device)
-        self.critic_2 = Critic(state_action_shape=self.input_dims+self.n_actions,
-                               name="critic_2", checkpoints_dir=checkpoints_dir).to(self.device)
+        self.critic = Critic(state_action_shape=self.input_dims+self.n_actions,
+                               name="critic", checkpoints_dir=checkpoints_dir).to(self.device)
 
         self.target_actor = Actor(state_shape=self.input_dims, num_actions=n_actions, 
                                   name="target_actor", checkpoints_dir=checkpoints_dir).to(self.device)
-        self.target_critic_1 = Critic(state_action_shape=self.input_dims+self.n_actions, 
-                                      name="target_critic_1", checkpoints_dir=checkpoints_dir).to(self.device)
-        self.target_critic_2 = Critic(state_action_shape=self.input_dims+self.n_actions, 
-                                      name="target_critic_2", checkpoints_dir=checkpoints_dir).to(self.device)
+        self.target_critic = Critic(state_action_shape=self.input_dims+self.n_actions, 
+                                      name="target_critic", checkpoints_dir=checkpoints_dir).to(self.device)
 
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.alpha)
-        self.critic_1_optimizer = optim.Adam(self.critic_1.parameters(), lr=self.beta)
-        self.critic_2_optimizer = optim.Adam(self.critic_2.parameters(), lr=self.beta)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.beta)
 
         self.target_actor_optimizer = optim.Adam(self.target_actor.parameters(), lr=self.alpha)
-        self.target_critic_1_optimizer = optim.Adam(self.target_critic_1.parameters(), lr=self.beta)
-        self.target_critic_2_optimizer = optim.Adam(self.target_critic_2.parameters(), lr=self.beta)
+        self.target_critic_optimizer = optim.Adam(self.target_critic.parameters(), lr=self.beta)
     
     
     def soft_update(self, target_network, source_network, tau):
@@ -107,7 +100,6 @@ class TD3Trainer:
 
         target_network.load_state_dict(target_params)
         
-        
     def update_target_parameters(self, tau=None):
         """
         Update the weights of the target actor and both target critic networks using soft update rule.
@@ -119,29 +111,26 @@ class TD3Trainer:
         self.soft_update(self.target_actor, self.actor, tau)
 
         # update weights of the first target critic network
-        self.soft_update(self.target_critic_1, self.critic_1, tau)
-
-        # update weights of the second target critic network
-        self.soft_update(self.target_critic_2, self.critic_2, tau)
+        self.soft_update(self.target_critic, self.critic, tau)
         
         
-    def select_action(self, observation):
+    def select_action(self, observation, train=True):
         """
         Select an action for the agent.
          
         """
-        # Selects random action to promote exploration for the exploration_period period
-        if self.time_step < self.exploration_period and self.is_trained==False:
-            mu = np.random.normal(scale=self.noise_factor, size=(self.n_actions,))
-        else:
-            state = torch.tensor([observation], dtype=torch.float32).to(self.device)
-            mu = self.actor(state).detach().cpu().numpy()[0]
-            
-        mu_star = mu + np.random.normal(scale=self.noise_factor, size=self.n_actions)   # add noise
-        mu_star = np.clip(mu_star, self.min_action, self.max_action)   # clip action
-        self.time_step += 1
+        if self.is_trained:
+            train = False
+        
+        state = torch.tensor([observation], dtype=torch.float32).to(self.device)
+        action = self.actor(state).detach().cpu().numpy()[0]
+        
+        if train:
+            action += np.random.normal(loc=0, scale=self.noise_factor, size=self.n_actions)
+        
+        action = np.clip(action, self.min_action, self.max_action)
 
-        return mu_star
+        return action
     
     
     def optimize_model(self):
@@ -153,6 +142,7 @@ class TD3Trainer:
         Perform gradient descent on the actor network with a delayed update schedule; 
         the actor is updated once for every two updates of the critic networks.
         """
+
         # check if there are enough experiences in memory
         if self.memory.size < self.batch_size:
             return
@@ -165,48 +155,32 @@ class TD3Trainer:
         rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
         next_states = torch.tensor(next_states, dtype=torch.float32).to(self.device)
         dones = torch.tensor(dones, dtype=torch.float32).to(self.device)
-
-        # apply gradient descent on the two critic networks
-        target_actions = self.target_actor(next_states) + torch.clamp(torch.randn_like(actions) * 0.2, -0.5, 0.5)
-        target_actions = torch.clamp(target_actions, self.min_action, self.max_action)
-
-        with torch.no_grad():
-            q1_new = self.target_critic_1(next_states, target_actions).squeeze(1)
-            q2_new = self.target_critic_2(next_states, target_actions).squeeze(1)
-            target = rewards + self.gamma * torch.min(q1_new, q2_new) * (1 - dones)
-
-        q1 = self.critic_1(states, actions).squeeze(1)
-        q2 = self.critic_2(states, actions).squeeze(1)
         
-        # critic loss
-        critic_1_loss = F.mse_loss(q1, target)
-        critic_2_loss = F.mse_loss(q2, target)
+        # calculate critic network loss
+        target_actions = self.target_actor(next_states)
+        new_critic_value = self.target_critic(next_states, target_actions).squeeze(1)
+        target = rewards + self.gamma * new_critic_value * (1 - dones)
+        critic_value = self.critic(states, actions).squeeze(1)
+        critic_loss = F.mse_loss(target, critic_value)
+        
+        # apply gradient descent with the calculated critic loss
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+        
+        # Calculate actor network loss
+        actor_loss = -self.critic(states, self.actor(states)).mean()
 
-        # gradient descent
-        self.critic_1_optimizer.zero_grad()
-        critic_1_loss.backward()
-        self.critic_1_optimizer.step()
-
-        self.critic_2_optimizer.zero_grad()
-        critic_2_loss.backward()
-        self.critic_2_optimizer.step()
-
-        # update the actor network only once for every two updates of critic networks
-        self.training_step_count += 1
-        if self.training_step_count % self.update_actor_every != 0:
-            return
-
-        actor_loss = -torch.mean(self.critic_1(states, self.actor(states)))
-
+        # Apply gradient descent with the calculated actor loss
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
-
+        
         # update actor/critic target networks weights with soft update rule
         self.update_target_parameters()
         
         
-    def td3_train(self, n_episodes=1500, opt_steps=64, reward_weights=None, 
+    def ddpg_train(self, n_episodes=1500, opt_steps=64, reward_weights=None, 
                   print_every=100, render_save_path=None, plot_save_path=None):
         
         if render_save_path:
@@ -235,10 +209,10 @@ class TD3Trainer:
                 state = np.concatenate((current_observation, achieved_goal, desired_goal))
                 # print(state)
 
-                # select action
+                # Choose an action
                 action = self.select_action(state)
 
-                # take action
+                # Execute the chosen action in the environment
                 next_observation, reward, done, truncated, _ = env.step(np.array(action))
                 next_obs, next_achieved_goal, next_desired_goal = next_observation.values()
                 next_state = np.concatenate((next_obs, next_achieved_goal, next_desired_goal))
@@ -251,7 +225,7 @@ class TD3Trainer:
                     
                     #print(reward_weights.t().shape, features.shape, reward.shape)
 
-                # store experience in replay buffer
+                # Store experience in the replay buffer
                 self.memory.push(state, action, reward, next_state, done)
 
                 obs_array.append(observation)
@@ -282,7 +256,6 @@ class TD3Trainer:
             if i % print_every==0 and i!=0:
                 print(f"Episode: {i} \t Steps: {step} \t Score: {score:.1f} \t Average score: {avg_score:.1f}")
             
-            # save model
             if self.model_save_path and i % (n_episodes//10)==0:
                 self.save_model()
                 
@@ -317,7 +290,7 @@ class TD3Trainer:
 
                 next_observation, _, _ = next_observations[future_index].values()
                 
-                # create next state representation with the same goal
+                # create next state representation with the same goal for consistency
                 next_state = torch.tensor(np.concatenate((next_observation, future_achieved_goal, 
                                                           future_achieved_goal)), dtype=torch.float32).to(self.device)
 
@@ -339,7 +312,7 @@ class TD3Trainer:
         """
         Normalize observation components and construct a feature vector for the given observation.
         """
-        # normalize observation components
+        # Normalize observation components
         obs = observation['observation']
         achieved_goal = observation['achieved_goal']
         desired_goal = observation['desired_goal']
@@ -351,7 +324,7 @@ class TD3Trainer:
         normalized_desired_goal = (desired_goal - self.env.observation_space['desired_goal'].low) / \
                                    (self.env.observation_space['desired_goal'].high - self.env.observation_space['desired_goal'].low)
 
-        # construct feature vector
+        # Construct feature vector
         feature_vector = np.concatenate((normalized_obs, normalized_achieved_goal, normalized_desired_goal))
 
         return torch.tensor(feature_vector, dtype=torch.float32)
@@ -364,7 +337,7 @@ class TD3Trainer:
         if env is None:
             env = self.env
         episode_score = 0
-        state_list = []     # list to store state feature vectors
+        state_list = []     # List to store state feature vectors
         
         observation, info = env.reset()
         current_observation, current_achieved_goal, current_desired_goal = observation.values()
@@ -377,7 +350,6 @@ class TD3Trainer:
         done = False
         truncated = False
         
-        # run the environment for some steps and collect rewards (and optionally states)
         with torch.inference_mode():
             for i in range(steps):
                 if render_save_path:
@@ -410,32 +382,8 @@ class TD3Trainer:
             return episode_score
         else:
             return episode_score, state_list
-                
-                
-    def save_model(self):
-        """
-        Save trained models.
-        """
-        torch.save(self.actor.state_dict(), self.actor.checkpoints_file)
-        torch.save(self.critic_1.state_dict(), self.critic_1.checkpoints_file)
-        torch.save(self.critic_2.state_dict(), self.critic_2.checkpoints_file)
-        torch.save(self.target_actor.state_dict(), self.target_actor.checkpoints_file)
-        torch.save(self.target_critic_1.state_dict(), self.target_critic_1.checkpoints_file)
-        torch.save(self.target_critic_2.state_dict(), self.target_critic_2.checkpoints_file)
-
-    def load_model(self):
-        """
-        Load trained models.
-        """
-        self.is_trained = True
-        self.actor.load_state_dict(torch.load(self.actor.checkpoints_file))
-        self.critic_1.load_state_dict(torch.load(self.critic_1.checkpoints_file))
-        self.critic_2.load_state_dict(torch.load(self.critic_2.checkpoints_file))
-        self.target_actor.load_state_dict(torch.load(self.target_actor.checkpoints_file))
-        self.target_critic_1.load_state_dict(torch.load(self.target_critic_1.checkpoints_file))
-        self.target_critic_2.load_state_dict(torch.load(self.target_critic_2.checkpoints_file))
-        
-        
+    
+    
     def plot_scores(self, scores, avg_scores, plot_save_path):
         """
         Plot performance of agent.
@@ -451,3 +399,23 @@ class TD3Trainer:
             plt.show()
         else:
             plt.show()
+                
+                
+    def save_model(self):
+        """
+        Save trained models.
+        """
+        torch.save(self.actor.state_dict(), self.actor.checkpoints_file)
+        torch.save(self.critic.state_dict(), self.critic.checkpoints_file)
+        torch.save(self.target_actor.state_dict(), self.target_actor.checkpoints_file)
+        torch.save(self.target_critic.state_dict(), self.target_critic.checkpoints_file)
+
+    def load_model(self):
+        """
+        Load trained models.
+        """
+        self.is_trained = True
+        self.actor.load_state_dict(torch.load(self.actor.checkpoints_file))
+        self.critic.load_state_dict(torch.load(self.critic.checkpoints_file))
+        self.target_actor.load_state_dict(torch.load(self.target_actor.checkpoints_file))
+        self.target_critic.load_state_dict(torch.load(self.target_critic.checkpoints_file))
